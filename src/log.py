@@ -12,6 +12,6 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(queue_handler)
 # uncomment if debugging thread sources in logs
 # formatter = logging.Formatter("%(threadName)s: >>> [%(message)s]")
-formatter = logging.Formatter(">>> [%(message)s]")
+formatter = logging.Formatter("[%(msecs)s] [%(message)s]")
 handler.setFormatter(formatter)
 listener.start()
