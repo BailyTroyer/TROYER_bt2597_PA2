@@ -1,4 +1,5 @@
 from log import logger
+import random
 import time
 import re
 import select
@@ -8,6 +9,10 @@ from threading import Thread, Event, Lock
 import signal
 
 import sys
+
+
+def decision(probability):
+    return random.random() < probability
 
 
 class ClientError(Exception):
@@ -134,17 +139,26 @@ class Sender:
             logger.info(f"ACK{pack_num} received, window moves to {self.window_base}")
             return
 
+        ## Handle DROPS based on mode resolution
+        mode, mode_value = self.opts["mode"], self.opts["mode_value"]
+        if mode == "-p":
+            # drop when the prob matches probabilistic
+            should_drop = decision(mode_value)
+        else:
+            # drop when the incoming index matches deterministic mode value
+            should_drop = pack_num == mode_value
+        # don't ack if should drop resolves TRUTHY
+        if should_drop:
+            logger.info(f"packet{pack_num} {message} discarded")
+            return
+
         logger.info(f"packet{pack_num} {message} received")
 
-        #### HANDLE DROPS HERE ####
-        ###                     ###
-        #### HANDLE DROPS HERE ####
-
-        # handle ACK ONLY if incoming message matches incoming seq num
-
+        ### Handle ACK ONLY if incoming message matches incoming seq num
         # Drop invalid incoming messages that don't match incoming seq number
         if pack_num > self.incoming_seq_num:
             # the sender will eventually timeout and send new message
+            logger.info(f"packet{pack_num} {message} dropped")
             return
 
         # send ACK to recv'er
@@ -294,6 +308,8 @@ def parse_mode(args):
     mode, mode_value = args
     if mode != "-p" and mode != "-d":
         raise InvalidArgException(f"{mode} is not a valid mode")
+    if mode == "-d" and not mode_value.isdigit():
+        raise InvalidArgException(f"<value> must be a valid digit")
     if not float(mode_value):
         raise InvalidArgException(f"{mode} <value> must be a valid digit")
 
