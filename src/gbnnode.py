@@ -23,17 +23,31 @@ class ClientError(Exception):
 
 class Sender:
     def __init__(self, opts):
+        # CLI args
         self.opts = opts
+
+        # Basic buffer array + lock
         self.buffer_lock = Lock()
         self.buffer = []
         self.window_size = opts["window_size"]
+
         # the last ack'ed message from receiver
         self.window_base = 0
         # the next index in window to send
         self.window_next_seq_num = 0
 
+        # increased on succesful ACKs
         self.incoming_seq_num = 0
-        self.timer_sleep_interval = 500  # 500ms
+        # used to compare in the timer against current inbox state
+        self.last_incoming_seq_num = 0
+        self.timer_sleep_interval = 500 / 1000  # 500ms (500ms/1000ms = 0.5s)
+
+        self.dropped_packet_numbers = []
+        # The message being sent (added to packet metadata)
+        self.total_message = ""
+        self.dropped_packets = 0
+        self.acked_packets = 0
+        self.partial_message = ""
 
     def send_packet(self, sock, packet):
         """Sends a single packet onto UDP socket."""
@@ -50,6 +64,7 @@ class Sender:
         if re.match("send (.*)", user_input):
             # Push to queue
             message = user_input.split(" ")[1]
+            self.total_message = message
             packets = list(message)
             with self.buffer_lock:
                 # logger.info(f"appending to buffer: {packets}")
@@ -76,21 +91,19 @@ class Sender:
 
     def encode_message(self, type, payload=None, metadata={}):
         """Convert plaintext user input to serialized message 'packet'."""
-        packet_num = self.window_next_seq_num
+
         message_metadata = {**self.opts, **metadata}
         message = {"type": type, "payload": payload, "metadata": message_metadata}
-        return json.dumps(message).encode("utf-8"), packet_num
+        return json.dumps(message).encode("utf-8")
 
     def send(self, sock, packet, seq_num):
         """Adds metadata to header and sends packet to UDP socket."""
-        metadata = {"packet_num": seq_num}
-        message, packet_num = self.encode_message("message", packet, metadata)
+        metadata = {"packet_num": seq_num, "total_message": self.total_message}
+        message = self.encode_message("message", packet, metadata)
         self.send_packet(sock, message)
-        return packet_num
 
     def send_buffer(self, stop_event):
         """Sends outbound buffer messages when available."""
-
         # Init sock for outbound messages
         sock = self.create_sock()
         while True:
@@ -110,14 +123,15 @@ class Sender:
                 window_offset = self.window_next_seq_num - self.window_base
                 is_within_window = window_offset < self.window_size
                 # Prevent sending sequence number thats gt buffer
-                is_seq_within_buffer = self.window_next_seq_num < len(self.buffer)
+                ## @TODO WINDOW NEXT SEQ NUM IS BASED ON SENT MESSAGES e.g. we just sent 2 messages thus seq num is 0->1->2
+                is_seq_within_buffer = window_offset < len(self.buffer)
 
                 if is_within_window and is_seq_within_buffer:
-                    next_packet = self.buffer[self.window_next_seq_num]
-                    packet_num = self.send(sock, next_packet, self.window_next_seq_num)
+                    next_packet = self.buffer[window_offset]
+                    pack_num = self.window_next_seq_num
+                    self.send(sock, next_packet, pack_num)
+                    logger.info(f"packet{pack_num} {next_packet} sent")
                     self.window_next_seq_num += 1
-
-                    logger.info(f"packet{packet_num} {next_packet} sent")
 
     def handle_incoming_message(self, sock, sender_ip, payload):
         """Sends ACK based on configured drop rate."""
@@ -126,14 +140,19 @@ class Sender:
             payload.get("payload"),
             payload.get("type"),
         )
+        total_message = metadata.get("total_message")
         pack_num = metadata.get("packet_num")
 
-        # if ACK handle increasing sender window params
+        # if ACK handle increasing sender window params and removing original message from buffer
         if type == "ack":
             # base should ONLY increase if pack_num matches sender base next seq num
             if pack_num != self.window_base:
                 logger.info(f"ACK{pack_num} discarded")
                 return
+
+            with self.buffer_lock:
+                ### @TODO IS THIS RIGHT OFFSETTING WITH WINDOW BASE
+                self.buffer.pop(pack_num - self.window_base)
 
             self.window_base += 1
             logger.info(f"ACK{pack_num} received, window moves to {self.window_base}")
@@ -146,9 +165,14 @@ class Sender:
             should_drop = decision(mode_value)
         else:
             # drop when the incoming index matches deterministic mode value
-            should_drop = pack_num == mode_value
+            should_drop = (
+                pack_num % mode_value == 0
+                and pack_num not in self.dropped_packet_numbers
+            )
         # don't ack if should drop resolves TRUTHY
         if should_drop:
+            self.dropped_packets += 1
+            self.dropped_packet_numbers.append(pack_num)
             logger.info(f"packet{pack_num} {message} discarded")
             return
 
@@ -161,15 +185,24 @@ class Sender:
             logger.info(f"packet{pack_num} {message} dropped")
             return
 
+        self.partial_message += message
+
         # send ACK to recv'er
         client_port = metadata.get("self_port")
         ack_metadata = {"packet_num": pack_num}
-        ack_message, ack_pack_num = self.encode_message("ack", None, ack_metadata)
+        ack_message = self.encode_message("ack", None, ack_metadata)
 
         # increase incoming seq num
         self.incoming_seq_num += 1
-        logger.info(f"ACK{ack_pack_num} sent, expecting packet{self.incoming_seq_num}")
-        # print("SENDER IP: ", sender_ip, client_port, ack_message)
+        logger.info(f"ACK{pack_num} sent, expecting packet{self.incoming_seq_num}")
+        self.acked_packets += 1
+
+        if self.partial_message == total_message:
+            total_packets = self.dropped_packets + self.acked_packets
+            logger.info(
+                f"[Summary] {self.dropped_packets}/{total_packets} packets discarded, loss rate = {self.dropped_packets/total_packets}%",
+            )
+
         sock.sendto(ack_message, (sender_ip, client_port))
 
     def sender_timer(self, stop_event):
@@ -177,28 +210,37 @@ class Sender:
 
         # Init sock for resending timed out messages
         sock = self.create_sock()
-        ## @TODO create decorator for wrapping thread w/ stop event
         while True:
             # Listen for kill events
             if stop_event.is_set():
                 logger.info("stopping listener")
                 break
 
+            with self.buffer_lock:
+                # do nothing if nothing outbound is being awaited
+                if len(self.buffer) == 0:
+                    continue
+
+            old_base = self.window_base
+
             time.sleep(self.timer_sleep_interval)
 
-            if self.window_base == self.window_next_seq_num:
-                return
+            # First message was recv'ed; we're ok
+            if self.window_base > old_base:
+                continue
 
-            # if window base != next_seq_num we ARE NOT in parity with recv'er
-
-            # handle resend logic
+            # handle resend logic (send whats remaining in window)
             logger.info(f"packet{self.window_base} timeout")
-
-            ## @TODO IS THIS OK USING TWICE IN 2 THREADS?
             with self.buffer_lock:
-                timed_out_pack = self.buffer[self.window_base]
-                # packet_num = self.send(sock, timed_out_pack)
-                # logger.info(f"packet{packet_num} {timed_out_pack} sent")
+                messages_to_send = self.buffer[
+                    0 : self.window_next_seq_num - self.window_base
+                ]
+
+                packet_seq_num = self.window_base
+                for packet in messages_to_send:
+                    self.send(sock, packet, packet_seq_num)
+                    logger.info(f"packet{packet_seq_num} {packet} sent")
+                    packet_seq_num += 1
 
     def server_listen(self, stop_event):
         """Listens on specified `client_port` for messages from server."""
@@ -230,7 +272,9 @@ class Sender:
             # start sending buffer listener
             send_buf_thread = Thread(target=self.send_buffer, args=(self.stop_event,))
             send_buf_thread.start()
-
+            # start outbound send timer listener
+            timer_thread = Thread(target=self.sender_timer, args=(self.stop_event,))
+            timer_thread.start()
             # Deadloop input 'till client ends
             while server_thread.is_alive() and not self.stop_event.is_set():
                 server_thread.join(1)
