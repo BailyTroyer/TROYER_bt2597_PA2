@@ -28,6 +28,7 @@ class Sender:
 
         # Basic buffer array + lock
         self.buffer_lock = Lock()
+        ## @TODO MAX THIS BUFFER SIZE
         self.buffer = []
         self.window_size = opts["window_size"]
 
@@ -47,6 +48,7 @@ class Sender:
         self.total_message = ""
         self.dropped_packets = 0
         self.acked_packets = 0
+        self.sent_packets = 0
         self.partial_message = ""
 
     def send_packet(self, sock, packet):
@@ -66,6 +68,8 @@ class Sender:
             message = user_input.split(" ")[1]
             self.total_message = message
             packets = list(message)
+            ## @TODO DEADLOOP WHILE BUFFER DOESN'T HAVE SPACE TO FIT EVERYTHIGN
+            ## @TODO USE A SIMPLE FOR LOOP TO INSERT INSTEAD OF EXTEND WITH MAX BUFFER SIZE
             with self.buffer_lock:
                 # logger.info(f"appending to buffer: {packets}")
                 self.buffer.extend(packets)
@@ -98,6 +102,7 @@ class Sender:
 
     def send(self, sock, packet, seq_num):
         """Adds metadata to header and sends packet to UDP socket."""
+        self.sent_packets += 1
         metadata = {"packet_num": seq_num, "total_message": self.total_message}
         message = self.encode_message("message", packet, metadata)
         self.send_packet(sock, message)
@@ -143,19 +148,33 @@ class Sender:
         total_message = metadata.get("total_message")
         pack_num = metadata.get("packet_num")
 
+        if type == "stats":
+            logger.info(message)
+            return
+
         # if ACK handle increasing sender window params and removing original message from buffer
         if type == "ack":
             # base should ONLY increase if pack_num matches sender base next seq num
             if pack_num != self.window_base:
                 logger.info(f"ACK{pack_num} discarded")
+                # self.dropped_packets += 1
                 return
 
             with self.buffer_lock:
                 ### @TODO IS THIS RIGHT OFFSETTING WITH WINDOW BASE
-                self.buffer.pop(pack_num - self.window_base)
+                ack_message = self.buffer.pop(pack_num - self.window_base)
+                # self.partial_message += ack_message
 
             self.window_base += 1
+            # self.acked_packets += 1
             logger.info(f"ACK{pack_num} received, window moves to {self.window_base}")
+            # if self.partial_message == total_message:
+            #     total_packets = (
+            #         self.dropped_packets + self.acked_packets + self.sent_packets
+            #     )
+            #     logger.info(
+            #         f"[Summary] {self.dropped_packets}/{total_packets} packets discarded, loss rate = {self.dropped_packets/total_packets}%",
+            #     )
             return
 
         ## Handle DROPS based on mode resolution
@@ -173,6 +192,7 @@ class Sender:
         if should_drop:
             self.dropped_packets += 1
             self.dropped_packet_numbers.append(pack_num)
+            ##### @TODO SHOULD RESENDS COUNT AGAINST DROPPED THINGS?
             logger.info(f"packet{pack_num} {message} discarded")
             return
 
@@ -189,7 +209,7 @@ class Sender:
 
         # send ACK to recv'er
         client_port = metadata.get("self_port")
-        ack_metadata = {"packet_num": pack_num}
+        ack_metadata = {"packet_num": pack_num, "total_message": total_message}
         ack_message = self.encode_message("ack", None, ack_metadata)
 
         # increase incoming seq num
@@ -197,13 +217,14 @@ class Sender:
         logger.info(f"ACK{pack_num} sent, expecting packet{self.incoming_seq_num}")
         self.acked_packets += 1
 
+        sock.sendto(ack_message, (sender_ip, client_port))
+
         if self.partial_message == total_message:
             total_packets = self.dropped_packets + self.acked_packets
-            logger.info(
-                f"[Summary] {self.dropped_packets}/{total_packets} packets discarded, loss rate = {self.dropped_packets/total_packets}%",
-            )
-
-        sock.sendto(ack_message, (sender_ip, client_port))
+            stats_message = f"[Summary] {self.dropped_packets}/{total_packets} packets discarded, loss rate = {self.dropped_packets/total_packets}%"
+            logger.info(stats_message)
+            stats_message = self.encode_message("stats", stats_message)
+            sock.sendto(stats_message, (sender_ip, client_port))
 
     def sender_timer(self, stop_event):
         """Attaches to last sent message and if no ACK is recv'ed within interval resends & resets."""
