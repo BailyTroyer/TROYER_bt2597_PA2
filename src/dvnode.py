@@ -33,7 +33,7 @@ class Link:
         self.opts = opts
         self.ip = "0.0.0.0"
         self.distance_vector_lock = Lock()
-        # { local_port: loss } for each links local_port
+        # { local_port: {loss, hops} } for each links local_port
         self.distance_vector = self.create_distance_vector(self.opts["neighbors"])
 
     def create_sock(self):
@@ -281,7 +281,14 @@ def parse_mode_and_go():
 
 
 if __name__ == "__main__":
-    """Start link and handle root errors."""
+    """Start link and handle root errors.
+
+    Example usage:
+    $ clear && python src/dvnode.py 1024 1025 0.01 1027 0.05
+    $ clear && python src/dvnode.py 1025 1024 0.01 1026 0.05
+    $ clear && python src/dvnode.py 1026 1025 0.05 1027 0.03
+    $ clear && python src/dvnode.py 1027 1024 0.05 1026 0.03 last
+    """
     try:
         parse_mode_and_go()
     except InvalidArgException as e:
