@@ -29,6 +29,7 @@ class LinkError(Exception):
 class Link:
     def __init__(self, opts):
         # CLI args
+        print("------")
         self.opts = opts
         self.ip = "0.0.0.0"
         self.distance_vector_lock = Lock()
@@ -58,19 +59,44 @@ class Link:
         message = {"type": type, "payload": payload, "metadata": message_metadata}
         return json.dumps(message).encode("utf-8")
 
-    def sync_distnace_vector(self, incoming_distance_vector):
-        """Updates distance vector baneighbor_ on updated neighbor vectors."""
-        ## @TODO
+    def sync_distance_vector(
+        self, incoming_port, incoming_distance_vector, old_distance_vector
+    ):
+        """Updates distance vector based on updated neighbor vectors."""
+        # This really helped solidify my understanding:
+        # https://www.youtube.com/watch?v=00AAnwgl2DI&ab_channel=Udacity
 
-    def is_different(self, dv1, dv2):
-        """Determines if two distance vectors are different."""
-        for k1, v1 in dv1.items():
-            for k2, v2 in dv2.items():
-                if k1 != k2:
-                    return False
-                if v1 != v2:
-                    return False
-        return True
+        incoming_port_loss = old_distance_vector[incoming_port]
+
+        for port, loss_rate in incoming_distance_vector.items():
+            port_ = int(port)
+            # ignore entry where its current local_port @TODO RIGHT??
+            if port_ == int(self.opts["local_port"]):
+                continue
+
+            incoming_port_loss_rate = round(
+                float(incoming_port_loss) + float(loss_rate), 2
+            )
+
+            existing_port_loss_rate = old_distance_vector.get(port_)
+            # add to dict summing the incoming port's loss in current vector
+            if not existing_port_loss_rate:
+                old_distance_vector[port_] = incoming_port_loss_rate
+            else:
+                if incoming_port_loss_rate < existing_port_loss_rate:
+                    old_distance_vector[port_] = incoming_port_loss_rate
+
+        # check if port exists in current (if not, compute sum of the source and its weight)
+        # e.g. if we have { 1025: 0.05, 1027: 0.03 } with incoming { 1024: 0.05, 1026: 0.03 } & source
+
+        return old_distance_vector
+
+    def print_updated_vector(self, vec):
+        """Prints the updated distance vector."""
+        ## @TODO next hop in prints
+        logger.info(f"[{time.time()}] Node {self.opts['local_port']} Routing Table")
+        for k, v in vec.items():
+            logger.info(f"- ({v}) -> Node {k}")
 
     def create_distance_vector(self, neighbors):
         """Creates first distance vector with starting neighbors."""
@@ -78,9 +104,7 @@ class Link:
         for neighbor in neighbors:
             port, loss = neighbor.get("port"), neighbor.get("loss")
             vector[port] = loss
-        print(f"[{time.time()}] Node {self.opts['local_port']} Routing Table")
-        for k, v in vector.items():
-            print(f"- ({v}) -> Node {k}")
+        self.print_updated_vector(vector)
         return vector
 
     def handle_incoming_message(self, sock, sender_ip, payload):
@@ -97,17 +121,28 @@ class Link:
 
         incoming_distance_vector = message.get("vector")
         incoming_port = metadata.get("local_port")
+        # logger.info(
+        #     f"Message {incoming_distance_vector} received at Node {self.opts['local_port']} from Node {incoming_port}"
+        # )
+
         logger.info(
-            f"Message {incoming_distance_vector} received at Node {self.opts['local_port']} from Node {incoming_port}"
+            f"Message received at Node {self.opts['local_port']} from Node {incoming_port}"
         )
 
         ## @TODO UPDATE DISTANCE VECTOR HERE AND HANDLE BELLMAN-FORD + SENDING UPDATES TO NEIGHBORS IF CHANGED
-        # with self.distance_vector_lock:
-        #     new_distance_vector = self.sync_distnace_vector(incoming_distance_vector)
+        with self.distance_vector_lock:
+            new_distance_vector = self.sync_distance_vector(
+                incoming_port, incoming_distance_vector, self.distance_vector.copy()
+            )
 
-        #     # If changed update and dispatch
-        #     if self.is_different(self.distance_vector, new_distance_vector):
-        #         self.dispatch_dv(sock, new_distance_vector)
+            self.print_updated_vector(new_distance_vector)
+
+            # If changed update and dispatch
+            if self.distance_vector != new_distance_vector:
+                # print("ITS DIFFERENT... DISPATCHING")
+                self.distance_vector = new_distance_vector
+
+                self.dispatch_dv(sock, new_distance_vector)
 
     def neighbor_listen(self, stop_event):
         """Listens on specified `local_port` for messages from other links."""
