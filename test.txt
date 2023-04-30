@@ -1,0 +1,11 @@
+███████ ███████ ███████     ████████ ██   ██ ███████     ██████  ███████  █████  ██████  ███    ███ ███████        ██  
+██      ██      ██             ██    ██   ██ ██          ██   ██ ██      ██   ██ ██   ██ ████  ████ ██          ██  ██ 
+███████ █████   █████          ██    ███████ █████       ██████  █████   ███████ ██   ██ ██ ████ ██ █████           ██ 
+     ██ ██      ██             ██    ██   ██ ██          ██   ██ ██      ██   ██ ██   ██ ██  ██  ██ ██          ██  ██ 
+███████ ███████ ███████        ██    ██   ██ ███████     ██   ██ ███████ ██   ██ ██████  ██      ██ ███████        ██ 
+
+Jesse said it was OK, and it allows me to use proper code blocks :D
+
+This was specified for PA1 so I assume likewise for PA2: https://edstem.org/us/courses/35445/discussion/2845731?answer=6518586
+
+Also PA2's spec says "It is optional to include this, as part of your README document."
