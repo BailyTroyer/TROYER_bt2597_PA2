@@ -65,7 +65,7 @@ class Sender:
         # Pattern match inputs to command methods
         if re.match("send (.*)", user_input):
             # Push to queue
-            message = user_input.split(" ")[1]
+            message = " ".join(user_input.split(" ")[1:])
             self.total_message = message
             packets = list(message)
             ## @TODO DEADLOOP WHILE BUFFER DOESN'T HAVE SPACE TO FIT EVERYTHIGN
