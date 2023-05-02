@@ -9,6 +9,16 @@ from threading import Thread, Event, Lock
 import signal
 
 import sys
+from messages import parse_help_message, gbn_help_message
+
+from utils import (
+    deadloop,
+    InvalidArgException,
+    valid_port,
+    SocketClient,
+    decode,
+    encode,
+)
 
 
 def decision(probability):
@@ -51,14 +61,10 @@ class Sender:
         self.sent_packets = 0
         self.partial_message = ""
 
-    def send_packet(self, sock, packet):
-        """Sends a single packet onto UDP socket."""
-        client_port, client_ip = self.opts["peer_port"], "0.0.0.0"
-        try:
-            client_destination = (client_ip, client_port)
-            sock.sendto(packet, client_destination)
-        except socket.error as e:
-            raise ClientError(f"UDP socket error: {e}")
+        self.stop_event = Event()
+        self.client = SocketClient(
+            self.opts["self_port"], self.stop_event, self.handle_incoming_message
+        )
 
     def handle_command(self, user_input):
         """Parses user plaintext and sends to proper destination."""
@@ -80,63 +86,44 @@ class Sender:
         """Custom wrapper that throws error when exit signal received."""
         print()  # this adds a nice newline when `^C` is entered
         self.stop_event.set()
-        raise ClientError(f"Client aborted... {signum}")
-
-    def create_sock(self):
-        """Create a socket."""
-        try:
-            return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        except socket.error as e:
-            raise ClientError(f"UDP client error when creating socket: {e}")
-
-    def decode_message(self, message):
-        """Convert bytes to deserialized JSON."""
-        return json.loads(message.decode("utf-8"))
+        raise ClientError()
 
     def encode_message(self, type, payload=None, metadata={}):
         """Convert plaintext user input to serialized message 'packet'."""
-
         message_metadata = {**self.opts, **metadata}
-        message = {"type": type, "payload": payload, "metadata": message_metadata}
-        return json.dumps(message).encode("utf-8")
+        return {"type": type, "payload": payload, "metadata": message_metadata}
 
-    def send(self, sock, packet, seq_num):
+    def send(self, packet, seq_num):
         """Adds metadata to header and sends packet to UDP socket."""
         self.sent_packets += 1
         metadata = {"packet_num": seq_num, "total_message": self.total_message}
         message = self.encode_message("message", packet, metadata)
-        self.send_packet(sock, message)
+        self.client.send(message, self.opts["peer_port"])
 
-    def send_buffer(self, stop_event):
+    @deadloop
+    def send_buffer(self):
         """Sends outbound buffer messages when available."""
-        # Init sock for outbound messages
-        sock = self.create_sock()
-        while True:
-            # Listen for kill events
-            if stop_event.is_set():
-                logger.info("stopping buffer sender listener")
-                break
+        with self.buffer_lock:
+            # check if we can send more messages from buffer
+            # buffer must be gt zero AND next_seq_num within window range
 
-            with self.buffer_lock:
-                # check if we can send more messages from buffer
-                # buffer must be gt zero AND next_seq_num within window range
+            if len(self.buffer) == 0:
+                return
 
-                if len(self.buffer) == 0:
-                    continue
+            # Can keep sending if next sequence number - window base <= window size
+            window_offset = self.window_next_seq_num - self.window_base
+            is_within_window = window_offset < self.window_size
+            # Prevent sending sequence number thats gt buffer
+            ## @TODO WINDOW NEXT SEQ NUM IS BASED ON SENT MESSAGES e.g. we just sent 2 messages thus seq num is 0->1->2
+            is_seq_within_buffer = window_offset < len(self.buffer)
 
-                # Can keep sending if next sequence number - window base <= window size
-                window_offset = self.window_next_seq_num - self.window_base
-                is_within_window = window_offset < self.window_size
-                # Prevent sending sequence number thats gt buffer
-                ## @TODO WINDOW NEXT SEQ NUM IS BASED ON SENT MESSAGES e.g. we just sent 2 messages thus seq num is 0->1->2
-                is_seq_within_buffer = window_offset < len(self.buffer)
+            if is_within_window and is_seq_within_buffer:
+                next_packet = self.buffer[window_offset]
+                pack_num = self.window_next_seq_num
+                self.send(next_packet, pack_num)
 
-                if is_within_window and is_seq_within_buffer:
-                    next_packet = self.buffer[window_offset]
-                    pack_num = self.window_next_seq_num
-                    self.send(sock, next_packet, pack_num)
-                    logger.info(f"packet{pack_num} {next_packet} sent")
-                    self.window_next_seq_num += 1
+                logger.info(f"packet{pack_num} {next_packet} sent")
+                self.window_next_seq_num += 1
 
     def handle_incoming_message(self, sock, sender_ip, payload):
         """Sends ACK based on configured drop rate."""
@@ -166,15 +153,7 @@ class Sender:
                 # self.partial_message += ack_message
 
             self.window_base += 1
-            # self.acked_packets += 1
             logger.info(f"ACK{pack_num} received, window moves to {self.window_base}")
-            # if self.partial_message == total_message:
-            #     total_packets = (
-            #         self.dropped_packets + self.acked_packets + self.sent_packets
-            #     )
-            #     logger.info(
-            #         f"[Summary] {self.dropped_packets}/{total_packets} packets discarded, loss rate = {self.dropped_packets/total_packets}%",
-            #     )
             return
 
         ## Handle DROPS based on mode resolution
@@ -210,7 +189,7 @@ class Sender:
         # send ACK to recv'er
         client_port = metadata.get("self_port")
         ack_metadata = {"packet_num": pack_num, "total_message": total_message}
-        ack_message = self.encode_message("ack", None, ack_metadata)
+        ack_message = encode(self.encode_message("ack", None, ack_metadata))
 
         # increase incoming seq num
         self.incoming_seq_num += 1
@@ -223,78 +202,51 @@ class Sender:
             total_packets = self.dropped_packets + self.acked_packets
             stats_message = f"[Summary] {self.dropped_packets}/{total_packets} packets discarded, loss rate = {self.dropped_packets/total_packets}%"
             logger.info(stats_message)
-            stats_message = self.encode_message("stats", stats_message)
+            stats_message = encode(self.encode_message("stats", stats_message))
             sock.sendto(stats_message, (sender_ip, client_port))
 
-    def sender_timer(self, stop_event):
+    @deadloop
+    def sender_timer(self):
         """Attaches to last sent message and if no ACK is recv'ed within interval resends & resets."""
+        with self.buffer_lock:
+            # do nothing if nothing outbound is being awaited
+            if len(self.buffer) == 0:
+                return
 
-        # Init sock for resending timed out messages
-        sock = self.create_sock()
-        while True:
-            # Listen for kill events
-            if stop_event.is_set():
-                logger.info("stopping listener")
-                break
+        old_base = self.window_base
 
-            with self.buffer_lock:
-                # do nothing if nothing outbound is being awaited
-                if len(self.buffer) == 0:
-                    continue
+        time.sleep(self.timer_sleep_interval)
 
-            old_base = self.window_base
+        # First message was recv'ed; we're ok
+        if self.window_base > old_base:
+            return
 
-            time.sleep(self.timer_sleep_interval)
+        # handle resend logic (send whats remaining in window)
+        logger.info(f"packet{self.window_base} timeout")
+        with self.buffer_lock:
+            messages_to_send = self.buffer[
+                0 : self.window_next_seq_num - self.window_base
+            ]
 
-            # First message was recv'ed; we're ok
-            if self.window_base > old_base:
-                continue
-
-            # handle resend logic (send whats remaining in window)
-            logger.info(f"packet{self.window_base} timeout")
-            with self.buffer_lock:
-                messages_to_send = self.buffer[
-                    0 : self.window_next_seq_num - self.window_base
-                ]
-
-                packet_seq_num = self.window_base
-                for packet in messages_to_send:
-                    self.send(sock, packet, packet_seq_num)
-                    logger.info(f"packet{packet_seq_num} {packet} sent")
-                    packet_seq_num += 1
-
-    def server_listen(self, stop_event):
-        """Listens on specified `client_port` for messages from server."""
-        sock = self.create_sock()
-        sock.bind(("", self.opts["self_port"]))
-
-        while True:
-            # Listen for kill events
-            if stop_event.is_set():
-                logger.info("stopping listener")
-                break
-
-            readables, writables, errors = select.select([sock], [], [], 1)
-            for read_socket in readables:
-                # logger.info("listening")
-                data, (sender_ip, sender_port) = read_socket.recvfrom(4096)
-                message = self.decode_message(data)
-                self.handle_incoming_message(read_socket, sender_ip, message)
+            packet_seq_num = self.window_base
+            for packet in messages_to_send:
+                self.send(packet, packet_seq_num)
+                logger.info(f"packet{packet_seq_num} {packet} sent")
+                packet_seq_num += 1
 
     def start(self):
         """Start both the user input listener and peer event listener."""
         try:
             # Handle signal events (e.g. `^C`)
-            self.stop_event = Event()
             signal.signal(signal.SIGINT, self.signal_handler)
             # start server listener
-            server_thread = Thread(target=self.server_listen, args=(self.stop_event,))
+            server_thread = Thread(target=self.client.listen)
             server_thread.start()
             # start sending buffer listener
-            send_buf_thread = Thread(target=self.send_buffer, args=(self.stop_event,))
+            send_buf_thread = Thread(target=self.send_buffer)
             send_buf_thread.start()
             # start outbound send timer listener
-            timer_thread = Thread(target=self.sender_timer, args=(self.stop_event,))
+            timer_thread = Thread(target=self.sender_timer)
             timer_thread.start()
             # Deadloop input 'till client ends
             while server_thread.is_alive() and not self.stop_event.is_set():
@@ -306,45 +258,13 @@ class Sender:
             signal.signal(signal.SIGINT, lambda s, f: None)
 
 
-help_message = """GbNode allows you to send chars to a client with defined loss.
-
-Flags:
-    -d      Drop packets in a deterministic way
-    -p      Drop packets with defined probability
-
-Options:
-    <self-port>: Sender port
-    <peer-port>: Reciever port
-    <window-size>: Size of GBN window
-
-Usage:
-    GbNode [flags] [options]"""
-
-
-class InvalidArgException(Exception):
-    """Thrown when CLI input arguments don't match expected type/structure/order."""
-
-    pass
-
-
-def valid_port(value):
-    """Validate port matches expected range 1024-65535."""
-    if value.isdigit():
-        val = int(value)
-        return val >= 1024 and val <= 65535
-    return False
-
-
 def parse_args(args):
     """Validate flags `<self-port>`, `<peer-port>`, `<window-size>`"""
-
     if len(args) != 3:
         raise InvalidArgException(
             "only accepts <self-port>, <peer-port> and <window-size>"
         )
-
     self_port, peer_port, window_size = args
-
     if not valid_port(self_port):
         raise InvalidArgException(
             f"Invalid <self-port>: {self_port}; Must be within 1024-65535"
@@ -357,7 +277,6 @@ def parse_args(args):
         raise InvalidArgException(
             f"Invalid <window-size>: {window_size}; Must be greater than zero"
         )
-
     return {
         "self_port": int(self_port),
         "peer_port": int(peer_port),
@@ -367,7 +286,6 @@ def parse_args(args):
 
 def parse_mode(args):
     """Validate `-p` or `-d` flag and arg."""
-
     if len(args) != 2:
         raise InvalidArgException("-p,-d only accepts <value>")
     mode, mode_value = args
@@ -377,15 +295,12 @@ def parse_mode(args):
         raise InvalidArgException(f"<value> must be a valid digit")
     if not float(mode_value):
         raise InvalidArgException(f"{mode} <value> must be a valid digit")
-
     return {"mode": mode, "mode_value": float(mode_value)}
 
 
 def parse_mode_and_go():
     """Validate root mode args: `-d` or `-p`."""
-    args = sys.argv[1:]
-    if len(args) == 0:
-        raise InvalidArgException(help_message)
+    args = parse_help_message(gbn_help_message)
 
     # validate common base args
     opts = parse_args(args[:3])
@@ -406,7 +321,4 @@ if __name__ == "__main__":
         sys.exit(1)
     except KeyboardInterrupt:
         print("Quitting.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Unknown error {e}.")
         sys.exit(1)
