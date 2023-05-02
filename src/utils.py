@@ -1,4 +1,5 @@
 import socket
+import signal
 import json
 import select
 from functools import wraps
@@ -20,10 +21,34 @@ def valid_port(value):
     return False
 
 
+class SignalError(Exception):
+    """Thrown when signal is captured."""
+
+
 class SocketClientError(Exception):
     """Thrown when Client errors during regular operation."""
 
     pass
+
+
+def handles_signal(method):
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        def _signal_handler(_s, _f):
+            """Custom wrapper that throws error when exit signal received."""
+            print()  # this adds a nice newline when `^C` is entered
+            self.stop_event.set()
+            raise SignalError()
+
+        try:
+            # Handle signal events (e.g. `^C`)
+            signal.signal(signal.SIGINT, _signal_handler)
+            method(self, *args, **kwargs)
+        except SignalError:
+            # Prevent exceptions when quickly spamming `^C`
+            signal.signal(signal.SIGINT, lambda _s, _f: None)
+
+    return wrapper
 
 
 def deadloop(method):
@@ -35,8 +60,6 @@ def deadloop(method):
                 break
 
             method(self, *args, **kwargs)
-
-        return
 
     return wrapper
 

@@ -18,6 +18,8 @@ from utils import (
     SocketClient,
     decode,
     encode,
+    handles_signal,
+    SignalError,
 )
 
 
@@ -81,12 +83,6 @@ class Sender:
                 self.buffer.extend(packets)
         else:
             logger.info(f"Unknown command `{user_input}`.")
-
-    def signal_handler(self, signum, _frame):
-        """Custom wrapper that throws error when exit signal received."""
-        print()  # this adds a nice newline when `^C` is entered
-        self.stop_event.set()
-        raise ClientError()
 
     def encode_message(self, type, payload=None, metadata={}):
         """Convert plaintext user input to serialized message 'packet'."""
@@ -234,28 +230,23 @@ class Sender:
                 logger.info(f"packet{packet_seq_num} {packet} sent")
                 packet_seq_num += 1
 
+    def start_gbn_threads(self):
+        """Starts listener, buffer sender and timeout sender threads."""
+        # Listens for incoming UDP messages
+        Thread(target=self.client.listen).start()
+        # Deadloops and dumps buffer to UDP socket when free
+        Thread(target=self.send_buffer).start()
+        # start outbound send timer listener
+        Thread(target=self.sender_timer).start()
+
+    @handles_signal
     def start(self):
-        """Start both the user input listener and peer event listener."""
-        try:
-            # Handle signal events (e.g. `^C`)
-            signal.signal(signal.SIGINT, self.signal_handler)
-            # start server listener
-            server_thread = Thread(target=self.client.listen)
-            server_thread.start()
-            # start sending buffer listener
-            send_buf_thread = Thread(target=self.send_buffer)
-            send_buf_thread.start()
-            # start outbound send timer listener
-            timer_thread = Thread(target=self.sender_timer)
-            timer_thread.start()
-            # Deadloop input 'till client ends
-            while server_thread.is_alive() and not self.stop_event.is_set():
-                server_thread.join(1)
-                user_input = input(f"node> ")
-                self.handle_command(user_input)
-        except ClientError:
-            # Prevent exceptions when quickly spamming `^C`
-            signal.signal(signal.SIGINT, lambda s, f: None)
+        """Start threads, and listen for input."""
+        self.start_gbn_threads()
+        # User input parsing (root of GBN sending)
+        while not self.stop_event.is_set():
+            user_input = input(f"node> ")
+            self.handle_command(user_input)
 
 
 def parse_args(args):
