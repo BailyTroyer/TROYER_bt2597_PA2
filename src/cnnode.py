@@ -7,6 +7,14 @@ import signal
 import socket
 import select
 
+from messages import parse_help_message, cn_help_message
+from utils import (
+    InvalidArgException,
+    valid_port,
+    SocketClient,
+    handles_signal,
+)
+
 
 class LinkError(Exception):
     """Thrown when Link errors during regular operation."""
@@ -14,7 +22,7 @@ class LinkError(Exception):
     pass
 
 
-class Link:
+class CNLink:
     def __init__(self, opts):
         # CLI args
         print("------")
@@ -283,29 +291,6 @@ class Link:
             signal.signal(signal.SIGINT, lambda s, f: None)
 
 
-help_message = """Cnnode leverages GBN and Bellman-Ford to synchronize loss rates between links.
-
-Flags:
-    last:   Last node information in network.
-
-Options:
-    <local-port>: Listening port
-    receive: Current node is probe receiver for subsequent neighbors
-    <neighbor#-port>: Neighbor's listening port
-    <loss-rate-#>: link distance to neighbor
-    send: Current node is probe sender for subsequent neighbors
-    <neighbor-port>: Neighbor's listening port (receiver for probe)
-    
-Usage:
-    Cnnode [...options] [flags]"""
-
-
-class InvalidArgException(Exception):
-    """Thrown when CLI input arguments don't match expected type/structure/order."""
-
-    pass
-
-
 def valid_port(value):
     """Validate port matches expected range 1024-65535."""
     if value.isdigit():
@@ -379,10 +364,7 @@ def parse_args(args):
 
 def parse_mode_and_go():
     """Validate send/receive neighbor options and check for end flag."""
-    args = sys.argv[1:]
-    if len(args) == 0:
-        raise InvalidArgException(help_message)
-
+    args = parse_help_message(cn_help_message)
     # validate args
     local_port, recv_neighbors, send_neighbors, is_last = parse_args(args)
 
@@ -392,7 +374,7 @@ def parse_mode_and_go():
         "send_neighbors": send_neighbors,
     }
 
-    link = Link(opts)
+    link = CNLink(opts)
     link.listen(is_last)
 
 

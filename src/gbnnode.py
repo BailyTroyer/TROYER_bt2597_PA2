@@ -107,6 +107,13 @@ class GBNode:
         """Handle incoming `ack` message type."""
         pack_num = itemgetter("packet_num")(metadata)
 
+        # Handle DROPS based on mode resolution
+        if self.should_drop(pack_num):
+            self.dropped_packets += 1
+            self.dropped_packet_numbers.append(pack_num)
+            logger.info(f"ACK{pack_num} discarded")
+            return
+
         # base should ONLY increase if pack_num matches sender base next seq num
         if pack_num != self.window_base:
             logger.info(f"ACK{pack_num} dropped")
@@ -125,8 +132,7 @@ class GBNode:
             return decision(self.mode_value)
         else:
             # drop when the incoming index matches deterministic mode value
-            is_drop_index = pack_num % self.mode_value == 0
-            ## @TODO SHOULD WE DROP ACKS TOO / the same thing more than once?
+            is_drop_index = pack_num % self.mode_value == 0 and pack_num != 0
             already_dropped_pack_num = pack_num in self.dropped_packet_numbers
             return is_drop_index and not already_dropped_pack_num
 
@@ -137,7 +143,7 @@ class GBNode:
 
         logger.info(f"packet{pack_num} {message} received")
 
-        ## Handle DROPS based on mode resolution
+        # Handle DROPS based on mode resolution
         if self.should_drop(pack_num):
             self.dropped_packets += 1
             self.dropped_packet_numbers.append(pack_num)

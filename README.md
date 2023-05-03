@@ -378,14 +378,166 @@ node> [172.25003242492676] [packet0 1 discarded]
 [740.2219772338867] [[Summary] 4/14 packets discarded, loss rate = 0.2857142857142857%]
 ```
 
+#### Sending 1k events converges to probability defined
+
+Running 1k chars in a send message (consisting of only "a") returns a result that's close to the probability defined.
+
+> Note: I've removed the whole trace since this would be too large to follow
+
+**Client 1:**
+```
+...
+[642.6939964294434] [ACK999 sent, expecting packet1000]
+[642.751932144165] [[Summary] 881/1881 packets discarded, loss rate = 0.468367889420521%]
+```
+
+**Client2:**
+```
+...
+[660.4390144348145] [ACK999 received, window moves to 1000]
+[660.538911819458] [[Summary] 881/1881 packets discarded, loss rate = 0.468367889420521%]
+```
+
 ### DV
 
-@TODO
+#### 4 node structure properly resolves optimal route with logs
+
+Since there's not many edge cases beyond changing input values, we can check with a simple 4-node setup.
+
+We can visualize the example with ports 1024-1027 (A-D going counter-clockwise) like so:
+
+1024 -- 0.05 -- 1027
+ |               |
+0.01            0.03
+ |               |
+1025 -- 0.05 -- 1026
+
+As we see below the 4 nodes after only 4 iterations get their respective routing tables that are optimal. The hops are also included.
+
+**Node A:**
+
+```
+$ python src/dvnode.py 1024 1025 0.01 1027 0.05
+[303.7729263305664] [[1683142953.303756] Node 1024 Routing Table]
+[303.82394790649414] [- (0.01) -> Node 1025]
+[303.84302139282227] [- (0.05) -> Node 1027]
+[231.1720848083496] [Message received at Node 1024 from Node 1027]
+[231.28008842468262] [[1683142958.231274] Node 1024 Routing Table]
+[231.30106925964355] [- (0.01) -> Node 1025]
+[231.31489753723145] [- (0.05) -> Node 1027]
+[231.32896423339844] [- (0.08) -> Node 1026; Next hop -> 1027]
+[231.34803771972656] [Message sent from Node 1024 to Node 1025]
+[231.54211044311523] [Message sent from Node 1024 to Node 1027]
+[231.64796829223633] [Message sent from Node 1024 to Node 1026]
+[232.2070598602295] [Message received at Node 1024 from Node 1026]
+[232.24186897277832] [[1683142958.232238] Node 1024 Routing Table]
+[232.25903511047363] [- (0.01) -> Node 1025]
+[232.27190971374512] [- (0.05) -> Node 1027]
+[232.2850227355957] [- (0.08) -> Node 1026; Next hop -> 1027]
+[232.31887817382812] [Message received at Node 1024 from Node 1025]
+[232.33580589294434] [[1683142958.2323341] Node 1024 Routing Table]
+[232.34891891479492] [- (0.01) -> Node 1025]
+[232.43999481201172] [- (0.05) -> Node 1027]
+[232.4521541595459] [- (0.06) -> Node 1026; Next hop -> 1025]
+[232.4819564819336] [Message received at Node 1024 from Node 1027]
+[232.4979305267334] [[1683142958.232496] Node 1024 Routing Table]
+[232.50985145568848] [- (0.01) -> Node 1025]
+[232.52105712890625] [- (0.05) -> Node 1027]
+[232.53202438354492] [- (0.06) -> Node 1026; Next hop -> 1025]
+```
+
+**Node B:**
+
+```
+$ python src/dvnode.py 1025 1024 0.01 1026 0.05
+[755.7430267333984] [[1683142955.755726] Node 1025 Routing Table]
+[755.7981014251709] [- (0.01) -> Node 1024]
+[755.8190822601318] [- (0.05) -> Node 1026]
+[231.5220832824707] [Message received at Node 1025 from Node 1026]
+[231.63390159606934] [[1683142958.2316291] Node 1025 Routing Table]
+[231.65583610534668] [- (0.01) -> Node 1024]
+[231.6720485687256] [- (0.05) -> Node 1026]
+[231.68587684631348] [- (0.08) -> Node 1027; Next hop -> 1026]
+[231.69994354248047] [Message sent from Node 1025 to Node 1024]
+[231.94503784179688] [Message sent from Node 1025 to Node 1026]
+[232.0699691772461] [Message sent from Node 1025 to Node 1027]
+[232.29098320007324] [Message received at Node 1025 from Node 1024]
+[232.3300838470459] [[1683142958.232325] Node 1025 Routing Table]
+[232.34891891479492] [- (0.01) -> Node 1024]
+[232.3629856109619] [- (0.05) -> Node 1026]
+[232.3770523071289] [- (0.06) -> Node 1027; Next hop -> 1024]
+[232.41019248962402] [Message received at Node 1025 from Node 1027]
+[232.42712020874023] [[1683142958.232425] Node 1025 Routing Table]
+[232.43999481201172] [- (0.01) -> Node 1024]
+[232.53512382507324] [- (0.05) -> Node 1026]
+[232.54799842834473] [- (0.06) -> Node 1027; Next hop -> 1024]
+```
+
+**Node C:**
+
+```
+$ python src/dvnode.py 1026 1025 0.05 1027 0.03
+[987.9307746887207] [[1683142956.987914] Node 1026 Routing Table]
+[987.9789352416992] [- (0.05) -> Node 1025]
+[988.0161285400391] [- (0.03) -> Node 1027]
+[231.11200332641602] [Message received at Node 1026 from Node 1027]
+[231.18996620178223] [[1683142958.2311838] Node 1026 Routing Table]
+[231.21213912963867] [- (0.05) -> Node 1025]
+[231.22787475585938] [- (0.03) -> Node 1027]
+[231.24194145202637] [- (0.08) -> Node 1024; Next hop -> 1027]
+[231.25600814819336] [Message sent from Node 1026 to Node 1025]
+[231.4450740814209] [Message sent from Node 1026 to Node 1027]
+[231.58502578735352] [Message sent from Node 1026 to Node 1024]
+[231.85110092163086] [Message received at Node 1026 from Node 1024]
+[231.89496994018555] [[1683142958.23189] Node 1026 Routing Table]
+[231.91285133361816] [- (0.05) -> Node 1025]
+[231.92715644836426] [- (0.03) -> Node 1027]
+[231.94003105163574] [- (0.08) -> Node 1024; Next hop -> 1027]
+[232.15198516845703] [Message received at Node 1026 from Node 1025]
+[232.19895362854004] [[1683142958.2321951] Node 1026 Routing Table]
+[232.21492767333984] [- (0.05) -> Node 1025]
+[232.22804069519043] [- (0.03) -> Node 1027]
+[232.2402000427246] [- (0.06) -> Node 1024; Next hop -> 1025]
+[232.27500915527344] [Message received at Node 1026 from Node 1027]
+[232.29217529296875] [[1683142958.232289] Node 1026 Routing Table]
+[232.30481147766113] [- (0.05) -> Node 1025]
+[232.38706588745117] [- (0.03) -> Node 1027]
+[232.40303993225098] [- (0.06) -> Node 1024; Next hop -> 1025]
+```
+
+**Node D:**
+
+```
+$ python src/dvnode.py 1027 1024 0.05 1026 0.03 last
+[230.11088371276855] [[1683142958.230091] Node 1027 Routing Table]
+[230.17191886901855] [- (0.05) -> Node 1024]
+[230.1938533782959] [- (0.03) -> Node 1026]
+[230.81493377685547] [Message sent from Node 1027 to Node 1024]
+[230.9279441833496] [Message sent from Node 1027 to Node 1026]
+[231.7061424255371] [Message received at Node 1027 from Node 1026]
+[231.8110466003418] [[1683142958.231801] Node 1027 Routing Table]
+[231.84990882873535] [- (0.05) -> Node 1024]
+[231.86683654785156] [- (0.03) -> Node 1026]
+[231.88090324401855] [- (0.08) -> Node 1025; Next hop -> 1026]
+[231.89401626586914] [Message sent from Node 1027 to Node 1024]
+[232.07402229309082] [Message sent from Node 1027 to Node 1026]
+[232.17415809631348] [Message sent from Node 1027 to Node 1025]
+[232.47098922729492] [Message received at Node 1027 from Node 1024]
+[232.51605033874512] [[1683142958.232512] Node 1027 Routing Table]
+[232.53393173217773] [- (0.05) -> Node 1024]
+[232.54799842834473] [- (0.03) -> Node 1026]
+[232.5601577758789] [- (0.06) -> Node 1025; Next hop -> 1024]
+[232.59806632995605] [Message received at Node 1027 from Node 1025]
+[232.61594772338867] [[1683142958.232613] Node 1027 Routing Table]
+[232.62786865234375] [- (0.05) -> Node 1024]
+[232.69987106323242] [- (0.03) -> Node 1026]
+[232.71608352661133] [- (0.06) -> Node 1025; Next hop -> 1024]
+```
 
 ### CN
 
 ## Callouts
 
-### GBN
+### Logging
 
-For deterministically based dropping we run a modulus to determine when a packet gets dropped. So if you specify -d 3 then the 0th, 3rd, 6th, etc will get dropped.
+I didn't want to implement multiple logger kinds, so the format for any message logged is `[ts] [message]` so where we expect the output for the routing table that also includes the timestamp.

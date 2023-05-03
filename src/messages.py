@@ -31,6 +31,23 @@ Usage:
     Dvnode [...options] [flags]"""
 
 
+cn_help_message = """Cnnode leverages GBN and Bellman-Ford to synchronize loss rates between links.
+
+Flags:
+    last:   Last node information in network.
+
+Options:
+    <local-port>: Listening port
+    receive: Current node is probe receiver for subsequent neighbors
+    <neighbor#-port>: Neighbor's listening port
+    <loss-rate-#>: link distance to neighbor
+    send: Current node is probe sender for subsequent neighbors
+    <neighbor-port>: Neighbor's listening port (receiver for probe)
+    
+Usage:
+    Cnnode [...options] [flags]"""
+
+
 def parse_help_message(message):
     """Shows message when only 1 arg is specified."""
 

@@ -61,7 +61,6 @@ class DVNode:
             else:
                 if incoming_port_loss_rate < existing_port_loss_rate.get("loss"):
                     existing[port_]["loss"] = incoming_port_loss_rate
-                    ## @TODO UPDATE HOPS FOR n hops, not just one
                     existing[port_]["hops"] = [incoming_port]
 
         # check if port exists in current (if not, compute sum of the source and its weight)
@@ -126,15 +125,15 @@ class DVNode:
     def listen(self, should_start):
         """Listens for incoming neighbor vectors. If `should_start` sends initial distance vector to neighbors."""
         # Listens for incoming UDP messages
-        Thread(target=self.client.listen).start()
+        client_listen = Thread(target=self.client.listen)
+        client_listen.start()
 
-        while not self.stop_event.isSet():
-            # send kickoff if CLI specified `last`
-            if should_start:
-                with self.distance_vector_lock:
-                    self.dispatch_dv(self.distance_vector)
+        # send kickoff if CLI specified `last`
+        if should_start:
+            with self.distance_vector_lock:
+                self.dispatch_dv(self.distance_vector)
 
-            continue
+        client_listen.join(1)
 
 
 def parse_args(args):
