@@ -17,6 +17,20 @@ Usage:
     GbNode [flags] [options]"""
 
 
+dv_help_message = """Dvnode constructs a bellman-ford based distance vector for all nodes in the network.
+
+Flags:
+    last:   Last node information in network.
+
+Options:
+    <local-port>: Listening port
+    <neighbor#-port>: Neighbor's listening port
+    <loss-rate-#>: link distance to neighbor
+
+Usage:
+    Dvnode [...options] [flags]"""
+
+
 def parse_help_message(message):
     """Shows message when only 1 arg is specified."""
 

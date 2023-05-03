@@ -1,27 +1,19 @@
 from log import logger
 from operator import itemgetter
-
 import random
 import time
 import re
-import select
-import socket
-import json
 from threading import Thread, Event, Lock
-import signal
-
 import sys
-from messages import parse_help_message, gbn_help_message, get_stats_message
 
+from messages import parse_help_message, gbn_help_message, get_stats_message
 from utils import (
     deadloop,
     InvalidArgException,
     valid_port,
     SocketClient,
-    decode,
     encode,
     handles_signal,
-    SignalError,
 )
 
 
@@ -39,7 +31,7 @@ class ClientError(Exception):
     pass
 
 
-class Sender:
+class GBNode:
     def __init__(self, port, peer_port, window_size, mode, mode_value):
         # Main Params
         self.port = port
@@ -296,13 +288,18 @@ def parse_mode_and_go():
     # valid deterministic or probabilistic args
     mode, mode_value = parse_mode(args[3:])
     # Construct main GBN sender class
-    sender = Sender(self_port, peer_port, window_size, mode, mode_value)
+    sender = GBNode(self_port, peer_port, window_size, mode, mode_value)
     # Listen for input and send to peer
     sender.start()
 
 
 if __name__ == "__main__":
-    """Start client and handle root errors."""
+    """Start client and handle root errors.
+
+    Example usage:
+    $ clear && python src/gbnnode.py 5000 5001 1 -p 0.5
+    $ clear && python src/gbnnode.py 5001 5000 1 -p 0.5
+    """
     try:
         parse_mode_and_go()
     except InvalidArgException as e:

@@ -1,63 +1,37 @@
 import sys
+from operator import itemgetter
 import time
 import json
 from threading import Thread, Event, Lock
 from log import logger
-import signal
-import socket
-import select
 
-## port > 1024
-## Max nodes 16
-## Static Link/node
-## Non negative links
-## NON-DIRECTIONAL
-
-
-## Dest is listening port, source is arbitrary UDP
-## **Data Field: sending UDP listen port, most recent routing table**
-
-### Lost/Out of Order: timestamp/sequence to each packet
+from messages import parse_help_message, dv_help_message
+from utils import (
+    InvalidArgException,
+    valid_port,
+    SocketClient,
+    handles_signal,
+)
 
 
-class LinkError(Exception):
-    """Thrown when Link errors during regular operation."""
-
-    pass
-
-
-class Link:
-    def __init__(self, opts):
+class DVNode:
+    def __init__(self, port, neighbors):
         # CLI args
-        print("------")
-        self.opts = opts
+        self.port = port
+        self.neighbors = neighbors
+
         self.ip = "0.0.0.0"
         self.distance_vector_lock = Lock()
         # { local_port: {loss, hops} } for each links local_port
-        self.distance_vector = self.create_distance_vector(self.opts["neighbors"])
+        self.distance_vector = self.create_distance_vector(neighbors)
 
-    def create_sock(self):
-        """Create a socket."""
-        try:
-            return socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        except socket.error as e:
-            raise LinkError(f"UDP link error when creating socket: {e}")
+        self.stop_event = Event()
+        self.client = SocketClient(port, self.stop_event, self.demux_incoming_message)
 
-    def signal_handler(self, signum, _frame):
-        """Custom wrapper that throws error when exit signal received."""
-        print()  # this adds a nice newline when `^C` is entered
-        self.stop_event.set()
-        raise LinkError(f"Link aborted... {signum}")
-
-    def decode_message(self, message):
-        """Convert bytes to deserialized JSON."""
-        return json.loads(message.decode("utf-8"))
-
-    def encode_message(self, type, payload=None):
+    def create_dv_message(self, type, payload=None):
         """Convert plaintext user input to serialized message 'packet'."""
-        message_metadata = {**self.opts}
-        message = {"type": type, "payload": payload, "metadata": message_metadata}
-        return json.dumps(message).encode("utf-8")
+        message_metadata = {"port": self.port, "neighbors": self.neighbors}
+        return {"type": type, "payload": payload, "metadata": message_metadata}
 
     def sync_distance_vector(self, incoming_port, incoming, existing):
         """Updates distance vector based on updated neighbor vectors."""
@@ -70,14 +44,13 @@ class Link:
             loss_rate, hops = port_data.get("loss"), port_data.get("hops")
             port_ = int(port)
 
-            if port_ == int(self.opts["local_port"]):
+            if port_ == int(self.port):
                 continue
 
             incoming_port_loss_rate = round(
                 float(incoming_port_loss) + float(loss_rate), 2
             )
 
-            print("EXISTGING: ", existing)
             existing_port_loss_rate = existing.get(port_)
             # add to dict summing the incoming port's loss in current vector
             if not existing_port_loss_rate:
@@ -93,14 +66,13 @@ class Link:
 
         # check if port exists in current (if not, compute sum of the source and its weight)
         # e.g. if we have { 1025: 0.05, 1027: 0.03 } with incoming { 1024: 0.05, 1026: 0.03 } & source
-
         return existing
 
     def print_updated_vector(self, vec):
         """Prints the updated distance vector."""
-        logger.info(f"[{time.time()}] Node {self.opts['local_port']} Routing Table")
+        logger.info(f"[{time.time()}] Node {self.port} Routing Table")
         for k, v in vec.items():
-            loss, hops = v.get("loss"), v.get("hops")
+            loss, hops = itemgetter("loss", "hops")(v)
             hops_messages = " ; ".join([f"Next hop -> {hop}" for hop in hops])
             combined_hops_message = f"; {hops_messages}" if hops else ""
             logger.info(f"- ({loss}) -> Node {k}{combined_hops_message}")
@@ -109,119 +81,60 @@ class Link:
         """Creates first distance vector with starting neighbors."""
         vector = {}
         for neighbor in neighbors:
-            port, loss = neighbor.get("port"), neighbor.get("loss")
+            port, loss = itemgetter("port", "loss")(neighbor)
             # hops are empty since its from current node on init
             vector[port] = {"loss": loss, "hops": []}
         self.print_updated_vector(vector)
         return vector
 
-    def handle_incoming_message(self, sock, payload):
+    def handle_incoming_dv(self, metadata, message):
         """Handles incoming neighbors distance vector."""
-        metadata, message, type = (
-            payload.get("metadata"),
-            payload.get("payload"),
-            payload.get("type"),
-        )
-
-        if type != "dv":
-            logger.info(f"Received invalid message type: {type}. Expecting ONLY `dv`")
-            return
-
-        incoming_dv, incoming_port = message.get("vector"), metadata.get("local_port")
-        local_port = self.opts["local_port"]
-
-        logger.info(f"Message received at Node {local_port} from Node {incoming_port}")
+        incoming_dv, incoming_port = message.get("vector"), metadata.get("port")
+        logger.info(f"Message received at Node { self.port} from Node {incoming_port}")
 
         with self.distance_vector_lock:
             new_distance_vector = self.sync_distance_vector(
                 incoming_port, incoming_dv, self.distance_vector.copy()
             )
-
             # we print regardless if it results in new dispatch
             self.print_updated_vector(new_distance_vector)
-
             # If changed update and dispatch
             if self.distance_vector != new_distance_vector:
                 self.distance_vector = new_distance_vector
-                self.dispatch_dv(sock, new_distance_vector)
+                self.dispatch_dv(new_distance_vector)
 
-    def neighbor_listen(self, stop_event):
-        """Listens on specified `local_port` for messages from other links."""
-        sock = self.create_sock()
-        sock.bind(("", self.opts["local_port"]))
+    def demux_incoming_message(self, _sock, _sender_ip, payload):
+        """Sends ACK based on configured drop rate."""
+        metadata, message, type = itemgetter("metadata", "payload", "type")(payload)
 
-        while True:
-            # Listen for kill events
-            if stop_event.is_set():
-                logger.info("stopping listener")
-                break
+        if type != "dv":
+            logger.info(f"Received invalid message type: {type}. Expecting ONLY `dv`")
+        else:
+            self.handle_incoming_dv(metadata, message)
 
-            readables, writables, errors = select.select([sock], [], [], 1)
-            for read_socket in readables:
-                data, (sender_ip, sender_port) = read_socket.recvfrom(4096)
-                message = self.decode_message(data)
-                self.handle_incoming_message(read_socket, message)
-
-    def listen(self, should_start):
-        """Listens for incoming neighbor vectors. If `should_start` sends initial distance vector to neighbors."""
-        try:
-            # Handle signal events (e.g. `^C`)
-            self.stop_event = Event()
-            signal.signal(signal.SIGINT, self.signal_handler)
-            # start server listener
-            neighbor_thread = Thread(
-                target=self.neighbor_listen, args=(self.stop_event,)
-            )
-            neighbor_thread.start()
-            # send kickoff if CLI specified `last`
-            if should_start:
-                sock = self.create_sock()
-                with self.distance_vector_lock:
-                    self.dispatch_dv(sock, self.distance_vector)
-            neighbor_thread.join()
-        except LinkError:
-            # Prevent exceptions when quickly spamming `^C`
-            signal.signal(signal.SIGINT, lambda s, f: None)
-
-    def send_dv(self, sock, port, dv):
-        """Sends current distance vector to neighbor."""
-        logger.info(f"Message sent from Node {self.opts['local_port']} to Node {port}")
-        dv_message = self.encode_message("dv", {"vector": dv})
-        sock.sendto(dv_message, (self.ip, port))
-
-    def dispatch_dv(self, sock, dv):
+    def dispatch_dv(self, dv):
         """Sends distance vector to neighbors in bulk."""
         for neighbor_port, _loss in dv.items():
-            if neighbor_port != self.opts["local_port"]:
-                self.send_dv(sock, neighbor_port, dv)
+            if neighbor_port == self.port:
+                continue
 
+            logger.info(f"Message sent from Node {self.port} to Node {neighbor_port}")
+            dv_message = self.create_dv_message("dv", {"vector": dv})
+            self.client.send(dv_message, neighbor_port, self.ip)
 
-help_message = """Dvnode constructs a bellman-ford baneighbor_ distance vector for all nodes in the network.
+    @handles_signal
+    def listen(self, should_start):
+        """Listens for incoming neighbor vectors. If `should_start` sends initial distance vector to neighbors."""
+        # Listens for incoming UDP messages
+        Thread(target=self.client.listen).start()
 
-Flags:
-    last:   Last node information in network.
+        while not self.stop_event.isSet():
+            # send kickoff if CLI specified `last`
+            if should_start:
+                with self.distance_vector_lock:
+                    self.dispatch_dv(self.distance_vector)
 
-Options:
-    <local-port>: Listening port
-    <neighbor#-port>: Neighbor's listening port
-    <loss-rate-#>: link distance to neighbor
-
-Usage:
-    Dvnode [...options] [flags]"""
-
-
-class InvalidArgException(Exception):
-    """Thrown when CLI input arguments don't match expected type/structure/order."""
-
-    pass
-
-
-def valid_port(value):
-    """Validate port matches expected range 1024-65535."""
-    if value.isdigit():
-        val = int(value)
-        return val >= 1024 and val <= 65535
-    return False
+            continue
 
 
 def parse_args(args):
@@ -269,14 +182,11 @@ def parse_args(args):
 
 def parse_mode_and_go():
     """Validate neighbor options and check for end flag."""
-    args = sys.argv[1:]
-    if len(args) == 0:
-        raise InvalidArgException(help_message)
-
+    args = parse_help_message(dv_help_message)
     # validate args
     local_port, neighbors, is_last = parse_args(args)
     # Create link and start if last flag was pasneighbor_ in CLI
-    link = Link({"local_port": local_port, "neighbors": neighbors})
+    link = DVNode(local_port, neighbors)
     link.listen(is_last)
 
 
@@ -296,7 +206,4 @@ if __name__ == "__main__":
         sys.exit(1)
     except KeyboardInterrupt:
         print("Quitting.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Unknown error {e}.")
         sys.exit(1)
