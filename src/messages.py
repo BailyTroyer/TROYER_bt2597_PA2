@@ -25,3 +25,9 @@ def parse_help_message(message):
         raise InvalidArgException(message)
 
     return args
+
+
+def get_stats_message(dropped_packets, total_packets):
+    """Prints stats message on both ends based on GBN loss data."""
+    loss = dropped_packets / total_packets
+    return f"[Summary] {dropped_packets}/{total_packets} packets discarded, loss rate = {loss}%"

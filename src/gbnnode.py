@@ -1,4 +1,6 @@
 from log import logger
+from operator import itemgetter
+
 import random
 import time
 import re
@@ -9,7 +11,7 @@ from threading import Thread, Event, Lock
 import signal
 
 import sys
-from messages import parse_help_message, gbn_help_message
+from messages import parse_help_message, gbn_help_message, get_stats_message
 
 from utils import (
     deadloop,
@@ -23,6 +25,10 @@ from utils import (
 )
 
 
+# 500ms (500ms/1000ms = 0.5s)
+TIMER_SLEEP_INTERVAL = 500 / 1000
+
+
 def decision(probability):
     return random.random() < probability
 
@@ -34,27 +40,30 @@ class ClientError(Exception):
 
 
 class Sender:
-    def __init__(self, opts):
-        # CLI args
-        self.opts = opts
-
-        # Basic buffer array + lock
+    def __init__(self, port, peer_port, window_size, mode, mode_value):
+        # Main Params
+        self.port = port
+        self.peer_port = peer_port
+        self.window_size = window_size
+        self.mode = mode
+        self.mode_value = mode_value
+        # GBN Logic
+        self.init_gbn_state()
         self.buffer_lock = Lock()
-        ## @TODO MAX THIS BUFFER SIZE
-        self.buffer = []
-        self.window_size = opts["window_size"]
+        self.stop_event = Event()
+        self.client = SocketClient(port, self.stop_event, self.demux_incoming_message)
 
+    def init_gbn_state(self):
+        """Initialize instance vars that depend on each GBN send."""
+        self.buffer = []
         # the last ack'ed message from receiver
         self.window_base = 0
         # the next index in window to send
-        self.window_next_seq_num = 0
-
+        self.next_seq_num = 0
         # increased on succesful ACKs
         self.incoming_seq_num = 0
         # used to compare in the timer against current inbox state
         self.last_incoming_seq_num = 0
-        self.timer_sleep_interval = 500 / 1000  # 500ms (500ms/1000ms = 0.5s)
-
         self.dropped_packet_numbers = []
         # The message being sent (added to packet metadata)
         self.total_message = ""
@@ -63,38 +72,17 @@ class Sender:
         self.sent_packets = 0
         self.partial_message = ""
 
-        self.stop_event = Event()
-        self.client = SocketClient(
-            self.opts["self_port"], self.stop_event, self.handle_incoming_message
-        )
-
-    def handle_command(self, user_input):
-        """Parses user plaintext and sends to proper destination."""
-        # Pattern match inputs to command methods
-        if re.match("send (.*)", user_input):
-            # Push to queue
-            message = " ".join(user_input.split(" ")[1:])
-            self.total_message = message
-            packets = list(message)
-            ## @TODO DEADLOOP WHILE BUFFER DOESN'T HAVE SPACE TO FIT EVERYTHIGN
-            ## @TODO USE A SIMPLE FOR LOOP TO INSERT INSTEAD OF EXTEND WITH MAX BUFFER SIZE
-            with self.buffer_lock:
-                # logger.info(f"appending to buffer: {packets}")
-                self.buffer.extend(packets)
-        else:
-            logger.info(f"Unknown command `{user_input}`.")
-
-    def encode_message(self, type, payload=None, metadata={}):
+    def create_gbn_message(self, type, payload=None, metadata={}):
         """Convert plaintext user input to serialized message 'packet'."""
-        message_metadata = {**self.opts, **metadata}
+        message_metadata = {"port": self.port, **metadata}
         return {"type": type, "payload": payload, "metadata": message_metadata}
 
     def send(self, packet, seq_num):
         """Adds metadata to header and sends packet to UDP socket."""
         self.sent_packets += 1
         metadata = {"packet_num": seq_num, "total_message": self.total_message}
-        message = self.encode_message("message", packet, metadata)
-        self.client.send(message, self.opts["peer_port"])
+        message = self.create_gbn_message("message", packet, metadata)
+        self.client.send(message, self.peer_port)
 
     @deadloop
     def send_buffer(self):
@@ -102,128 +90,129 @@ class Sender:
         with self.buffer_lock:
             # check if we can send more messages from buffer
             # buffer must be gt zero AND next_seq_num within window range
-
             if len(self.buffer) == 0:
                 return
-
             # Can keep sending if next sequence number - window base <= window size
-            window_offset = self.window_next_seq_num - self.window_base
+            window_offset = self.next_seq_num - self.window_base
             is_within_window = window_offset < self.window_size
             # Prevent sending sequence number thats gt buffer
-            ## @TODO WINDOW NEXT SEQ NUM IS BASED ON SENT MESSAGES e.g. we just sent 2 messages thus seq num is 0->1->2
             is_seq_within_buffer = window_offset < len(self.buffer)
-
+            # only dump buffer when seq-base is within window index range
             if is_within_window and is_seq_within_buffer:
+                # fetch from buffer and send, increasing next seq num
                 next_packet = self.buffer[window_offset]
-                pack_num = self.window_next_seq_num
+                pack_num = self.next_seq_num
                 self.send(next_packet, pack_num)
-
                 logger.info(f"packet{pack_num} {next_packet} sent")
-                self.window_next_seq_num += 1
+                self.next_seq_num += 1
 
-    def handle_incoming_message(self, sock, sender_ip, payload):
-        """Sends ACK based on configured drop rate."""
-        metadata, message, type = (
-            payload.get("metadata"),
-            payload.get("payload"),
-            payload.get("type"),
-        )
-        total_message = metadata.get("total_message")
-        pack_num = metadata.get("packet_num")
+    def handle_incoming_stats(self, message):
+        """Handles incoming `stats` message type."""
+        logger.info(get_stats_message(**message))
+        self.init_gbn_state()
 
-        if type == "stats":
-            logger.info(message)
+    def handle_incoming_ack(self, metadata):
+        """Handle incoming `ack` message type."""
+        pack_num = itemgetter("packet_num")(metadata)
+
+        # base should ONLY increase if pack_num matches sender base next seq num
+        if pack_num != self.window_base:
+            logger.info(f"ACK{pack_num} dropped")
             return
+        # remove original message from buffer
+        with self.buffer_lock:
+            self.buffer.pop(pack_num - self.window_base)
+        # increase window base from removed message in buffer
+        self.window_base += 1
+        logger.info(f"ACK{pack_num} received, window moves to {self.window_base}")
 
-        # if ACK handle increasing sender window params and removing original message from buffer
-        if type == "ack":
-            # base should ONLY increase if pack_num matches sender base next seq num
-            if pack_num != self.window_base:
-                logger.info(f"ACK{pack_num} discarded")
-                # self.dropped_packets += 1
-                return
-
-            with self.buffer_lock:
-                ### @TODO IS THIS RIGHT OFFSETTING WITH WINDOW BASE
-                ack_message = self.buffer.pop(pack_num - self.window_base)
-                # self.partial_message += ack_message
-
-            self.window_base += 1
-            logger.info(f"ACK{pack_num} received, window moves to {self.window_base}")
-            return
-
-        ## Handle DROPS based on mode resolution
-        mode, mode_value = self.opts["mode"], self.opts["mode_value"]
-        if mode == "-p":
+    def should_drop(self, pack_num):
+        """Determines whether current packet is dropped based on config."""
+        if self.mode == "-p":
             # drop when the prob matches probabilistic
-            should_drop = decision(mode_value)
+            return decision(self.mode_value)
         else:
             # drop when the incoming index matches deterministic mode value
-            should_drop = (
-                pack_num % mode_value == 0
-                and pack_num not in self.dropped_packet_numbers
-            )
-        # don't ack if should drop resolves TRUTHY
-        if should_drop:
-            self.dropped_packets += 1
-            self.dropped_packet_numbers.append(pack_num)
-            ##### @TODO SHOULD RESENDS COUNT AGAINST DROPPED THINGS?
-            logger.info(f"packet{pack_num} {message} discarded")
-            return
+            is_drop_index = pack_num % self.mode_value == 0
+            ## @TODO SHOULD WE DROP ACKS TOO / the same thing more than once?
+            already_dropped_pack_num = pack_num in self.dropped_packet_numbers
+            return is_drop_index and not already_dropped_pack_num
+
+    def handle_incoming_message(self, sender_ip, sock, payload, metadata):
+        """Handle incoming `message` message type."""
+        metadata, message = itemgetter("metadata", "payload")(payload)
+        total_message, pack_num = itemgetter("total_message", "packet_num")(metadata)
 
         logger.info(f"packet{pack_num} {message} received")
 
-        ### Handle ACK ONLY if incoming message matches incoming seq num
-        # Drop invalid incoming messages that don't match incoming seq number
-        if pack_num > self.incoming_seq_num:
-            # the sender will eventually timeout and send new message
-            logger.info(f"packet{pack_num} {message} dropped")
+        ## Handle DROPS based on mode resolution
+        if self.should_drop(pack_num):
+            self.dropped_packets += 1
+            self.dropped_packet_numbers.append(pack_num)
+            logger.info(f"packet{pack_num} {message} discarded")
             return
 
-        self.partial_message += message
-
-        # send ACK to recv'er
-        client_port = metadata.get("self_port")
-        ack_metadata = {"packet_num": pack_num, "total_message": total_message}
-        ack_message = encode(self.encode_message("ack", None, ack_metadata))
+        # Handle ACK ONLY if incoming message matches incoming seq num
+        # Drop invalid incoming messages that don't match incoming seq number
+        if pack_num > self.incoming_seq_num:
+            logger.info(f"packet{pack_num} {message} dropped")
+            return
 
         # increase incoming seq num
         self.incoming_seq_num += 1
         logger.info(f"ACK{pack_num} sent, expecting packet{self.incoming_seq_num}")
         self.acked_packets += 1
 
+        # send ACK to recv'er
+        client_port = itemgetter("port")(metadata)
+        ack_metadata = {"packet_num": pack_num, "total_message": total_message}
+        ack_message = encode(self.create_gbn_message("ack", None, ack_metadata))
         sock.sendto(ack_message, (sender_ip, client_port))
 
+        # Check if we've hit end
+        self.partial_message += message
         if self.partial_message == total_message:
             total_packets = self.dropped_packets + self.acked_packets
-            stats_message = f"[Summary] {self.dropped_packets}/{total_packets} packets discarded, loss rate = {self.dropped_packets/total_packets}%"
-            logger.info(stats_message)
-            stats_message = encode(self.encode_message("stats", stats_message))
+            stats_data = {
+                "dropped_packets": self.dropped_packets,
+                "total_packets": total_packets,
+            }
+            logger.info(get_stats_message(**stats_data))
+            stats_message = encode(self.create_gbn_message("stats", stats_data))
             sock.sendto(stats_message, (sender_ip, client_port))
+            self.init_gbn_state()
+
+    def demux_incoming_message(self, sock, sender_ip, payload):
+        """Sends ACK based on configured drop rate."""
+        metadata, message, type = itemgetter("metadata", "payload", "type")(payload)
+        if type == "stats":
+            self.handle_incoming_stats(message)
+            return
+        elif type == "ack":
+            self.handle_incoming_ack(metadata)
+            return
+        elif type == "message":
+            self.handle_incoming_message(sender_ip, sock, payload, metadata)
 
     @deadloop
     def sender_timer(self):
         """Attaches to last sent message and if no ACK is recv'ed within interval resends & resets."""
+        # do nothing if nothing outbound is being awaited
         with self.buffer_lock:
-            # do nothing if nothing outbound is being awaited
             if len(self.buffer) == 0:
                 return
 
-        old_base = self.window_base
-
-        time.sleep(self.timer_sleep_interval)
-
         # First message was recv'ed; we're ok
-        if self.window_base > old_base:
+        pre_timer_base = self.window_base
+        time.sleep(TIMER_SLEEP_INTERVAL)
+        if self.window_base > pre_timer_base:
             return
 
         # handle resend logic (send whats remaining in window)
         logger.info(f"packet{self.window_base} timeout")
         with self.buffer_lock:
-            messages_to_send = self.buffer[
-                0 : self.window_next_seq_num - self.window_base
-            ]
-
+            # window_base and next_seq_num are constantly inc thus we get relative position
+            messages_to_send = self.buffer[0 : self.next_seq_num - self.window_base]
             packet_seq_num = self.window_base
             for packet in messages_to_send:
                 self.send(packet, packet_seq_num)
@@ -238,6 +227,19 @@ class Sender:
         Thread(target=self.send_buffer).start()
         # start outbound send timer listener
         Thread(target=self.sender_timer).start()
+
+    def handle_command(self, user_input):
+        """Parses user plaintext and sends to proper destination."""
+        # Pattern match inputs to command methods
+        if re.match("send (.*)", user_input):
+            # Push to queue
+            message = " ".join(user_input.split(" ")[1:])
+            self.total_message = message
+            packets = list(message)
+            with self.buffer_lock:
+                self.buffer.extend(packets)
+        else:
+            logger.info(f"Unknown command `{user_input}`.")
 
     @handles_signal
     def start(self):
@@ -268,11 +270,7 @@ def parse_args(args):
         raise InvalidArgException(
             f"Invalid <window-size>: {window_size}; Must be greater than zero"
         )
-    return {
-        "self_port": int(self_port),
-        "peer_port": int(peer_port),
-        "window_size": int(window_size),
-    }
+    return int(self_port), int(peer_port), int(window_size)
 
 
 def parse_mode(args):
@@ -284,22 +282,22 @@ def parse_mode(args):
         raise InvalidArgException(f"{mode} is not a valid mode")
     if mode == "-d" and not mode_value.isdigit():
         raise InvalidArgException(f"<value> must be a valid digit")
-    if not float(mode_value):
+    mode_val_float = float(mode_value)
+    if mode_val_float != 0 and not mode_val_float:
         raise InvalidArgException(f"{mode} <value> must be a valid digit")
-    return {"mode": mode, "mode_value": float(mode_value)}
+    return mode, float(mode_value)
 
 
 def parse_mode_and_go():
     """Validate root mode args: `-d` or `-p`."""
     args = parse_help_message(gbn_help_message)
-
     # validate common base args
-    opts = parse_args(args[:3])
+    self_port, peer_port, window_size = parse_args(args[:3])
     # valid deterministic or probabilistic args
-    mode_opts = parse_mode(args[3:])
-
+    mode, mode_value = parse_mode(args[3:])
     # Construct main GBN sender class
-    sender = Sender({**mode_opts, **opts})
+    sender = Sender(self_port, peer_port, window_size, mode, mode_value)
+    # Listen for input and send to peer
     sender.start()
 
 
