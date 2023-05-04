@@ -115,6 +115,9 @@ class DVNode:
                 self.on_message(payload)
             self.handle_incoming_dv(metadata, message)
 
+    def send(self, message, peer_port):
+        self.client.send(message, peer_port, self.ip)
+
     def dispatch_dv(self, dv):
         """Sends distance vector to neighbors in bulk."""
         for neighbor_port, _loss in dv.items():

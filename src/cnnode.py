@@ -16,7 +16,7 @@ from utils import (
     handles_signal,
     deadloop,
 )
-
+from gbnnode import GBNode, GenericGBNode
 from dvnode import DVNode
 
 LOSS_RATE_PRINT_INTERVAL = 1
@@ -42,11 +42,31 @@ class CNLink:
         empty_neighbors.append({"port": port, "loss": 0})
         self.dv_node = DVNode(port, empty_neighbors, self.demux_incoming_dv_message)
 
-        self.is_sending_probes_lock = Lock()
-        self.is_sending_probes = False
+        self.sending_probes_lock = Lock()
+        self.sending_probes = {}
 
         self.loss_rates_lock = Lock()
         self.loss_rates = {}
+
+        self.recv_gbnodes = {}
+        for recv in recv_neighbors:
+            recv_port, loss = itemgetter("port", "loss")(recv)
+            self.start_gbn_listener(recv_port, loss)
+
+    def start_gbn_listener(self, recv_port, loss):
+        gbnode = GenericGBNode(
+            self.port,
+            recv_port,
+            5,
+            "-p",
+            loss,
+            self.stop_event,
+            self.on_send_gbn,
+        )
+        self.recv_gbnodes[recv_port] = gbnode
+
+    def on_send_gbn(self, message, peer_port):
+        print(f"should send {message} to {peer_port}")
 
     def create_probe_message(self, type):
         message_metadata = {"port": self.port}
@@ -67,24 +87,36 @@ class CNLink:
                 logger.info(f"Link to {port}: {sent} sent, {lost} lost, loss {rate}")
         time.sleep(LOSS_RATE_PRINT_INTERVAL)
 
+    def on_stats(self, message, metadata):
+        with self.sending_probes_lock:
+            self.sending_probes[metadata.get("port")] = False
+        print(f"got stats for {metadata}")
+
     @deadloop
     def handle_send_probes(self):
         """Sends probes at specified interval to proper neighbors. Also starts 1s loss rate prints."""
         # send probes to each send neighbor
         for send_neighbor_port in self.send_neighbors:
-            cost = self.link_cost(send_neighbor_port)
-            ## @TODO WHAT DOES COST HAVE TO DO HERE SINCE SEND NEIGHBORS DON'T CONFIGURE THAT
-            probe_message = self.create_probe_message("probe")
-            # print("SENDING PROBES...", probe_message)
-            ## @TODO UNCOMMENT THIS
-            # sock.sendto(probe_message, (self.ip, send_neighbor_port))
+            with self.sending_probes_lock:
+                if not self.sending_probes.get(send_neighbor_port, False):
+                    ## @TODO SEND PROBE HERE via GBNode
+                    gb_node = GenericGBNode(
+                        self.port,
+                        send_neighbor_port,
+                        5,
+                        "-p",
+                        0,
+                        self.stop_event,
+                        self.dv_node.send,
+                        self.on_stats,
+                    )
+                    gb_node.handle_command("send probe")
 
     def demux_incoming_dv_message(self, _payload):
         """Callback when DV recv'es message."""
         # Kickoff probe sender and loss rate printer when initial DV is sent
-        with self.is_sending_probes_lock:
-            if not self.is_sending_probes:
-                self.is_sending_probes = True
+        with self.sending_probes_lock:
+            if self.sending_probes == {}:
                 Thread(target=self.handle_send_probes).start()
                 Thread(target=self.print_loss_rate).start()
 

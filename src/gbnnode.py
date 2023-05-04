@@ -31,8 +31,18 @@ class ClientError(Exception):
     pass
 
 
-class GBNode:
-    def __init__(self, port, peer_port, window_size, mode, mode_value):
+class GenericGBNode:
+    def __init__(
+        self,
+        port,
+        peer_port,
+        window_size,
+        mode,
+        mode_value,
+        stop_event,
+        on_send,
+        on_stats=None,
+    ):
         # Main Params
         self.port = port
         self.peer_port = peer_port
@@ -42,8 +52,9 @@ class GBNode:
         # GBN Logic
         self.init_gbn_state()
         self.buffer_lock = Lock()
-        self.stop_event = Event()
-        self.client = SocketClient(port, self.stop_event, self.demux_incoming_message)
+        self.on_send = on_send
+        self.stop_event = stop_event
+        self.on_stats = on_stats
 
     def init_gbn_state(self):
         """Initialize instance vars that depend on each GBN send."""
@@ -74,7 +85,7 @@ class GBNode:
         self.sent_packets += 1
         metadata = {"packet_num": seq_num, "total_message": self.total_message}
         message = self.create_gbn_message("message", packet, metadata)
-        self.client.send(message, self.peer_port)
+        self.on_send(message, self.peer_port)
 
     @deadloop
     def send_buffer(self):
@@ -98,21 +109,23 @@ class GBNode:
                 logger.info(f"packet{pack_num} {next_packet} sent")
                 self.next_seq_num += 1
 
-    def handle_incoming_stats(self, message):
+    def handle_incoming_stats(self, message, metadata):
         """Handles incoming `stats` message type."""
-        logger.info(get_stats_message(**message))
         self.init_gbn_state()
+        if self.on_stats:
+            self.on_stats(message, metadata)
 
     def handle_incoming_ack(self, metadata):
         """Handle incoming `ack` message type."""
         pack_num = itemgetter("packet_num")(metadata)
 
         # Handle DROPS based on mode resolution
-        if self.should_drop(pack_num):
-            self.dropped_packets += 1
-            self.dropped_packet_numbers.append(pack_num)
-            logger.info(f"ACK{pack_num} discarded")
-            return
+        ## @TODO UNCOMMENT THIS
+        # if self.should_drop(pack_num):
+        #     self.dropped_packets += 1
+        #     self.dropped_packet_numbers.append(pack_num)
+        #     logger.info(f"ACK{pack_num} discarded")
+        #     return
 
         # base should ONLY increase if pack_num matches sender base next seq num
         if pack_num != self.window_base:
@@ -184,7 +197,7 @@ class GBNode:
         """Sends ACK based on configured drop rate."""
         metadata, message, type = itemgetter("metadata", "payload", "type")(payload)
         if type == "stats":
-            self.handle_incoming_stats(message)
+            self.handle_incoming_stats(message, metadata)
             return
         elif type == "ack":
             self.handle_incoming_ack(metadata)
@@ -217,17 +230,9 @@ class GBNode:
                 logger.info(f"packet{packet_seq_num} {packet} sent")
                 packet_seq_num += 1
 
-    def start_gbn_threads(self):
-        """Starts listener, buffer sender and timeout sender threads."""
-        # Listens for incoming UDP messages
-        Thread(target=self.client.listen).start()
-        # Deadloops and dumps buffer to UDP socket when free
-        Thread(target=self.send_buffer).start()
-        # start outbound send timer listener
-        Thread(target=self.sender_timer).start()
-
     def handle_command(self, user_input):
         """Parses user plaintext and sends to proper destination."""
+
         # Pattern match inputs to command methods
         if re.match("send (.*)", user_input):
             # Push to queue
@@ -239,6 +244,41 @@ class GBNode:
         else:
             logger.info(f"Unknown command `{user_input}`.")
 
+
+class GBNode:
+    def __init__(self, port, peer_port, window_size, mode, mode_value):
+        self.stop_event = Event()
+        self.node = GenericGBNode(
+            port,
+            peer_port,
+            window_size,
+            mode,
+            mode_value,
+            self.stop_event,
+            self.on_send,
+            self.on_stats,
+        )
+
+        self.client = SocketClient(
+            port, self.stop_event, self.node.demux_incoming_message
+        )
+
+    def on_stats(self, message, metadata):
+        logger.info(get_stats_message(**message))
+
+    def on_send(self, message, peer_port):
+        """Wraps generic GBN for sending."""
+        self.client.send(message, peer_port)
+
+    def start_gbn_threads(self):
+        """Starts listener, buffer sender and timeout sender threads."""
+        # Listens for incoming UDP messages
+        Thread(target=self.client.listen).start()
+        # Deadloops and dumps buffer to UDP socket when free
+        Thread(target=self.node.send_buffer).start()
+        # start outbound send timer listener
+        Thread(target=self.node.sender_timer).start()
+
     @handles_signal
     def start(self):
         """Start threads, and listen for input."""
@@ -246,7 +286,7 @@ class GBNode:
         # User input parsing (root of GBN sending)
         while not self.stop_event.is_set():
             user_input = input(f"node> ")
-            self.handle_command(user_input)
+            self.node.handle_command(user_input)
 
 
 def parse_args(args):

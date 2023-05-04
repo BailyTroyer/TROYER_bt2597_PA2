@@ -1,5 +1,7 @@
 # bt2597 PA2
 
+https://github.com/BailyTroyer/TROYER_bt2597_PA2
+
 ## Code Architecture
 
 ### File Structure
@@ -73,7 +75,17 @@ We have a lock on the distance vector object which gets read from two threads:
 
 **For CN:**
 
-@TODO
+I was unable to get a running version of this working so I've included the code (less probes being succesfully sent) due to the lack of generic logic implemented in the DV/GBN code.
+
+I'm hoping the comments and @TODOs show the working state I've left off on for partial credit.
+
+What I've done (which is visible in the commit history if you inspect the git repo) includes dispatching the threads for listening to DVNode state from the CNNodes, sending the initial DV status ONLY on first message cascaded from the last caller.
+
+The trick/issue I was last running into was getting the messages to succesfully propogate over the GBN codebase via a single socket without needing gross logic/code for dynamic ports.
+
+If I was able to get the send logic working via the GBN code then the rest of the logic would involve calling the DVNode `sync_distance_vector` and `dispatch_dv` on the new probe stats.
+
+> Note: I was able to generalize the GenericGBNode to take an on_stats message, but for some reason no data was being sent in the cnnode's `handle_send_probes`
 
 ## Usage
 
@@ -541,3 +553,7 @@ $ python src/dvnode.py 1027 1024 0.05 1026 0.03 last
 ### Logging
 
 I didn't want to implement multiple logger kinds, so the format for any message logged is `[ts] [message]` so where we expect the output for the routing table that also includes the timestamp.
+
+### CNNode not sending via GenericGBNode
+
+As commented in the section on CNNode above, I was unable to get sending debugged and working, but the comments in the cnnode should help explain my thought process on the internal business logic of sending the probes with a lock on the active GenericGBNode instances.
