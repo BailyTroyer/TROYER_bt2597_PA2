@@ -15,7 +15,7 @@ from utils import (
 
 
 class DVNode:
-    def __init__(self, port, neighbors):
+    def __init__(self, port, neighbors, on_message=None):
         # CLI args
         self.port = port
         self.neighbors = neighbors
@@ -28,6 +28,8 @@ class DVNode:
         self.stop_event = Event()
         self.client = SocketClient(port, self.stop_event, self.demux_incoming_message)
 
+        self.on_message = on_message
+
     def create_dv_message(self, type, payload=None):
         """Convert plaintext user input to serialized message 'packet'."""
         message_metadata = {"port": self.port, "neighbors": self.neighbors}
@@ -38,7 +40,7 @@ class DVNode:
         # This really helped solidify my understanding:
         # https://www.youtube.com/watch?v=00AAnwgl2DI&ab_channel=Udacity
 
-        incoming_port_loss = existing[incoming_port]["loss"]
+        incoming_port_loss = existing.get(incoming_port, {}).get("loss", 0)
 
         for port, port_data in incoming.items():
             loss_rate, hops = port_data.get("loss"), port_data.get("hops")
@@ -109,6 +111,8 @@ class DVNode:
         if type != "dv":
             logger.info(f"Received invalid message type: {type}. Expecting ONLY `dv`")
         else:
+            if self.on_message:
+                self.on_message(payload)
             self.handle_incoming_dv(metadata, message)
 
     def dispatch_dv(self, dv):
@@ -117,7 +121,9 @@ class DVNode:
             if neighbor_port == self.port:
                 continue
 
-            logger.info(f"Message sent from Node {self.port} to Node {neighbor_port}")
+            logger.info(
+                f"DV Message sent from Node {self.port} to Node {neighbor_port}"
+            )
             dv_message = self.create_dv_message("dv", {"vector": dv})
             self.client.send(dv_message, neighbor_port, self.ip)
 
