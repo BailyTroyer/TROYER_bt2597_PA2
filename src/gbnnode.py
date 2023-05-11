@@ -55,6 +55,7 @@ class GenericGBNode:
         self.on_send = on_send
         self.stop_event = stop_event
         self.on_stats = on_stats
+        self.last_acked = 0
 
     def init_gbn_state(self):
         """Initialize instance vars that depend on each GBN send."""
@@ -115,21 +116,20 @@ class GenericGBNode:
         if self.on_stats:
             self.on_stats(message, metadata)
 
-    def handle_incoming_ack(self, metadata):
+    def handle_incoming_ack(self, sender_ip, sock, metadata):
         """Handle incoming `ack` message type."""
         pack_num = itemgetter("packet_num")(metadata)
 
         # Handle DROPS based on mode resolution
-        ## @TODO UNCOMMENT THIS
-        # if self.should_drop(pack_num):
-        #     self.dropped_packets += 1
-        #     self.dropped_packet_numbers.append(pack_num)
-        #     logger.info(f"ACK{pack_num} discarded")
-        #     return
+        if self.should_drop(pack_num):
+            self.dropped_packets += 1
+            self.dropped_packet_numbers.append(pack_num)
+            logger.info(f"ACK{pack_num} discarded")
+            return
 
         # base should ONLY increase if pack_num matches sender base next seq num
         if pack_num != self.window_base:
-            logger.info(f"ACK{pack_num} dropped")
+            logger.info(f"ACK{pack_num} dropped, at base {self.window_base}")
             return
         # remove original message from buffer
         with self.buffer_lock:
@@ -164,15 +164,33 @@ class GenericGBNode:
             return
 
         # Handle ACK ONLY if incoming message matches incoming seq num
-        # Drop invalid incoming messages that don't match incoming seq number
         if pack_num > self.incoming_seq_num:
             logger.info(f"packet{pack_num} {message} dropped")
+            return
+
+        if pack_num < self.incoming_seq_num:
+            logger.info(
+                f"dup ACK{pack_num} sent, expecting packet{self.incoming_seq_num}"
+            )
+            client_port = itemgetter("port")(metadata)
+            ack_metadata = {
+                "packet_num": pack_num,
+                "total_message": total_message,
+            }
+            ack_message = encode(self.create_gbn_message("ack", None, ack_metadata))
+            sock.sendto(ack_message, (sender_ip, client_port))
             return
 
         # increase incoming seq num
         self.incoming_seq_num += 1
         logger.info(f"ACK{pack_num} sent, expecting packet{self.incoming_seq_num}")
         self.acked_packets += 1
+
+        if pack_num == 0 and self.last_acked == 0:
+            self.partial_message = message
+        elif pack_num > self.last_acked:
+            self.partial_message += message
+            self.last_acked = pack_num
 
         # send ACK to recv'er
         client_port = itemgetter("port")(metadata)
@@ -181,7 +199,6 @@ class GenericGBNode:
         sock.sendto(ack_message, (sender_ip, client_port))
 
         # Check if we've hit end
-        self.partial_message += message
         if self.partial_message == total_message:
             total_packets = self.dropped_packets + self.acked_packets
             stats_data = {
@@ -200,7 +217,7 @@ class GenericGBNode:
             self.handle_incoming_stats(message, metadata)
             return
         elif type == "ack":
-            self.handle_incoming_ack(metadata)
+            self.handle_incoming_ack(sender_ip, sock, metadata)
             return
         elif type == "message":
             self.handle_incoming_message(sender_ip, sock, payload, metadata)
